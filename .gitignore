@@ -10,6 +10,9 @@
 .snapshots/
 #Testing Output folder
 .output/
+
+.env
+venv
 #Extension App-file
 *.app
 #Rapid Application Development File
@@ -20,3 +23,4 @@ rad.json
 *.flf
 #Test results file
 TestResults.xml
+project-nn400-fire
