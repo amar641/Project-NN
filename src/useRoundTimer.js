@@ -2,7 +2,7 @@ import { useState, useEffect, useRef } from "react";
 import { collection, addDoc } from "firebase/firestore";
 import { db } from "./firebase";
 
-const ROUND_DURATION = 60;  // seconds
+const ROUND_DURATION = 30;  // seconds
 const VOTING_CUTOFF  = 5;   // stop voting 5s before end
 
 export function useRoundTimer() {
