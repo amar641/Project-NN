@@ -46,3 +46,4 @@ __pycache__/
 .env
 firebase_key.json
 __pycache__/
+serviceAccount.json
