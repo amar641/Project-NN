@@ -1,10 +1,12 @@
-// src/App.jsx
+// src/App.jsx  (updated – adds prediction banner + metrics card)
 import { useState, useEffect, useRef } from "react";
 import {
-  collection, doc, getDoc, setDoc, onSnapshot, query
+  collection, doc, getDoc, setDoc, onSnapshot, query, orderBy, limit
 } from "firebase/firestore";
 import { db } from "./firebase";
 import { useRoundTimer, ROUND_DURATION } from "./useRoundTimer";
+import { useMetrics } from "./useMetrics";
+import MetricsChart from "./MetricsChart";
 import { v4 as uuidv4 } from "uuid";
 import "./App.css";
 
@@ -21,15 +23,18 @@ const EMOTION_OPTIONS = [
   { value: "low",         label: "Low" },
   { value: "very_low",    label: "Very Low" },
 ];
-
 const INFLUENCE_OPTIONS = [
   { value: "yes",     label: "Yes" },
   { value: "neutral", label: "Neutral" },
   { value: "no",      label: "No" },
 ];
 
+// ─── API base URL – change to your backend URL in production ─────────────────
+const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
+
 export default function App() {
   const { timeRemaining, currentRound, votingOpen } = useRoundTimer();
+  const metrics = useMetrics(100);
 
   const [hasVoted,         setHasVoted]         = useState(false);
   const [userVote,         setUserVote]         = useState(null);
@@ -39,32 +44,61 @@ export default function App() {
   const [greenVotes,       setGreenVotes]       = useState(0);
   const [roundWinner,      setRoundWinner]      = useState(null);
   const [roundHistory,     setRoundHistory]     = useState([]);
+  const [prediction,       setPrediction]       = useState(null);
+  const [humanCount,       setHumanCount]       = useState(0);
+  const [voterList,        setVoterList]        = useState([]);
 
   const prevRoundRef = useRef(currentRound);
   const winnerRef    = useRef(null);
 
+  // Live vote count
   useEffect(() => {
     if (!currentRound) return;
     const votesCol = collection(db, "rounds", String(currentRound), "votes");
     const unsub = onSnapshot(query(votesCol), (snap) => {
-      let red = 0, green = 0;
-      snap.forEach((d) => { if (d.data().color === "RED") red++; else green++; });
+      let red = 0, green = 0, humans = 0;
+      snap.forEach((d) => {
+        const data = d.data();
+        if (data.color === "RED") red++; else green++;
+        if (!data.isAgent) humans++;
+      });
       setRedVotes(red);
       setGreenVotes(green);
+      setHumanCount(humans);
+      // Build sorted voter list: humans first, then agents
+      const allVoters = [];
+      snap.forEach((d) => allVoters.push(d.data()));
+      allVoters.sort((a, b) => (a.isAgent ? 1 : -1) - (b.isAgent ? 1 : -1));
+      setVoterList(allVoters);
     });
     return () => unsub();
   }, [currentRound]);
 
+  // Load prediction for current round
+  useEffect(() => {
+    if (!currentRound) return;
+    const ref = doc(db, "roundResults", String(currentRound));
+    const unsub = onSnapshot(ref, (snap) => {
+      if (snap.exists()) {
+        const d = snap.data();
+        setPrediction(d.prediction || null);
+        if (d.winner) setRoundWinner(d.winner);
+      }
+    });
+    return () => unsub();
+  }, [currentRound]);
+
+  // Check if already voted
   useEffect(() => {
     if (!currentRound) return;
     const voteDoc = doc(db, "rounds", String(currentRound), "votes", USER_ID);
     getDoc(voteDoc).then((snap) => {
       if (snap.exists()) {
-        const data = snap.data();
+        const d = snap.data();
         setHasVoted(true);
-        setUserVote(data.color);
-        setEmotionFeel(data.emotionFeel || "neutral");
-        setInfluenceHistory(data.influenceHistory || "neutral");
+        setUserVote(d.color);
+        setEmotionFeel(d.emotionFeel || "neutral");
+        setInfluenceHistory(d.influenceHistory || "neutral");
       } else {
         setHasVoted(false);
         setUserVote(null);
@@ -72,14 +106,15 @@ export default function App() {
     });
   }, [currentRound]);
 
+  // Voting closed
   useEffect(() => {
     if (!votingOpen) {
       const w = redVotes > greenVotes ? "RED" : greenVotes > redVotes ? "GREEN" : "TIE";
-      setRoundWinner(w);
       winnerRef.current = w;
     }
   }, [votingOpen]);
 
+  // Round transition
   useEffect(() => {
     if (currentRound !== prevRoundRef.current) {
       const finished = prevRoundRef.current;
@@ -91,6 +126,8 @@ export default function App() {
       }
       setHasVoted(false); setUserVote(null); setRoundWinner(null);
       setEmotionFeel("neutral"); setInfluenceHistory("neutral");
+      setPrediction(null);
+      setVoterList([]);
       winnerRef.current = null;
       prevRoundRef.current = currentRound;
     }
@@ -100,9 +137,17 @@ export default function App() {
     if (!votingOpen || hasVoted) return;
     setHasVoted(true); setUserVote(color);
     try {
+      // Write directly to Firestore (backend reads it)
       const voteDoc = doc(db, "rounds", String(currentRound), "votes", USER_ID);
-      await setDoc(voteDoc, { userId: USER_ID, color, emotionFeel, influenceHistory, votedAt: Date.now() });
-    } catch (e) { setHasVoted(false); setUserVote(null); }
+      await setDoc(voteDoc, {
+        userId: USER_ID, color,
+        emotionFeel, influenceHistory,
+        isAgent: false,
+        votedAt: Date.now(),
+      });
+    } catch (e) {
+      setHasVoted(false); setUserVote(null);
+    }
   }
 
   const timerPct      = (timeRemaining / ROUND_DURATION) * 100;
@@ -114,10 +159,32 @@ export default function App() {
     <div className="app">
       <NeuralBg />
 
+      {/* ── Main voting card ─────────────────────────────────────── */}
       <div className="card main-card">
         <div className="nn-label">◈ NEURAL NETWORK VOTING SYSTEM</div>
         <h1>Project NN</h1>
         <h3>Round <span className="round-badge">#{currentRound}</span></h3>
+
+        {/* Prediction banner */}
+        {prediction && (
+          <div className={`prediction-banner prediction-${prediction.toLowerCase()}`}>
+            🧠 HMNN Predicts: <strong>{prediction}</strong>
+            {roundWinner && (
+              <span className="prediction-result">
+                &nbsp;— Actual: <strong>{roundWinner}</strong>
+                {prediction === roundWinner ? " ✅" : " ❌"}
+              </span>
+            )}
+          </div>
+        )}
+
+        {/* Human voter count */}
+        <div className="voter-count">
+          👤 <strong>{humanCount}</strong> human{humanCount !== 1 ? "s" : ""} voted
+          {humanCount < 12 && votingOpen && (
+            <span className="agent-fill"> · {12 - humanCount} agent slots available</span>
+          )}
+        </div>
 
         <div className="timer-ring-wrap">
           <svg className="timer-ring" viewBox="0 0 120 120">
@@ -189,10 +256,44 @@ export default function App() {
               <span className="metric-label">GREEN</span>
               <span className="metric-value green-text">{greenVotes}</span>
             </div>
+            <div className="divider-v" />
+            <div className="metric">
+              <span className="metric-label">Total</span>
+              <span className="metric-value">{redVotes + greenVotes}/12</span>
+            </div>
           </div>
         )}
       </div>
 
+      {/* ── Voter list after round ends ───────────────────────────── */}
+      {!votingOpen && voterList.length > 0 && (
+        <div className="card voter-list-card">
+          <div className="nn-label">◈ ALL VOTES THIS ROUND ({voterList.length}/12)</div>
+          <div className="voter-list">
+            {voterList.map((v, i) => (
+              <div key={v.userId || i} className={`voter-row voter-${v.color?.toLowerCase()}`}>
+                <span className="voter-name">
+                  {v.isAgent ? "🤖" : "👤"} {v.agentName || "You"}
+                </span>
+                <span className={`voter-color badge-${v.color?.toLowerCase()}`}>
+                  {v.color === "RED" ? "🔴 RED" : "🟢 GREEN"}
+                </span>
+                <span className="voter-meta">
+                  {v.emotionFeel} · {v.influenceHistory}
+                </span>
+              </div>
+            ))}
+          </div>
+        </div>
+      )}
+
+      {/* ── Live metrics chart card ───────────────────────────────── */}
+      <div className="card metrics-card">
+        <div className="nn-label">◈ LIVE MODEL PERFORMANCE</div>
+        <MetricsChart metrics={metrics} />
+      </div>
+
+      {/* ── Round history ────────────────────────────────────────── */}
       {roundHistory.length > 0 && (
         <div className="card history-card">
           <div className="history-title">◈ Past Round Results</div>
