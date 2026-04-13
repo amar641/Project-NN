@@ -1,20 +1,30 @@
 // src/useRoundTimer.js
-import { useState, useEffect, useRef, useCallback } from "react";
+import { useState, useEffect, useRef } from "react";
 import { doc, setDoc, onSnapshot, getDoc } from "firebase/firestore";
 import { db } from "./firebase";
 
-export const ROUND_DURATION = 30; // seconds per round
-export const VOTING_CUTOFF = 5;   // stop voting this many seconds before end
+export const ROUND_DURATION  = 30;  // total seconds
+export const HUMAN_CUTOFF    = 10;  // humans stop voting when 10s remain
+export const AGENT_CUTOFF    = 5;   // agents done when 5s remain
+export const PREDICT_CUTOFF  = 0;   // prediction shown in last 5s (when <=5s remain)
+
+// Phase labels for the frontend
+// 0-20s  elapsed (30-10 remaining): VOTING  - humans can vote
+// 20-25s elapsed (10-5  remaining): AGENTS  - agents voting, humans locked
+// 25-30s elapsed (5-0   remaining): PREDICT - prediction visible, counting down
+export function getPhase(timeRemaining) {
+  if (timeRemaining > HUMAN_CUTOFF) return "voting";    // >10s left
+  if (timeRemaining > AGENT_CUTOFF) return "agents";    // 6-10s left
+  return "predict";                                      // 0-5s left
+}
 
 const ROUND_DOC = doc(db, "gameState", "currentRound");
 
-// ─── Helper: write new round to Firestore (only if still on old round) ───────
 async function advanceRound(expectedRound) {
   try {
-    // Read first to avoid overwriting a round already advanced by another user
     const snap = await getDoc(ROUND_DOC);
     if (!snap.exists()) return;
-    if (snap.data().round !== expectedRound) return; // already advanced
+    if (snap.data().round !== expectedRound) return;
     await setDoc(ROUND_DOC, {
       round: expectedRound + 1,
       startedAt: Date.now(),
@@ -24,7 +34,6 @@ async function advanceRound(expectedRound) {
   }
 }
 
-// ─── Initialize Firestore round doc if it doesn't exist ──────────────────────
 async function ensureRoundDoc() {
   const snap = await getDoc(ROUND_DOC);
   if (!snap.exists()) {
@@ -33,64 +42,54 @@ async function ensureRoundDoc() {
 }
 
 export function useRoundTimer() {
-  // roundData = what's in Firestore (source of truth)
-  const [roundData, setRoundData] = useState(null);
+  const [roundData,      setRoundData]      = useState(null);
+  const [timeRemaining,  setTimeRemaining]  = useState(ROUND_DURATION);
+  const [phase,          setPhase]          = useState("voting");
 
-  // Derived local timer state (updated every second via setInterval)
-  const [timeRemaining, setTimeRemaining] = useState(ROUND_DURATION);
-  const [votingOpen, setVotingOpen]       = useState(true);
+  const intervalRef  = useRef(null);
+  const advancingRef = useRef(false);
 
-  // Refs to avoid stale closures in intervals
-  const intervalRef      = useRef(null);
-  const advancingRef     = useRef(false);   // prevents multiple advance() calls
-
-  // ── Step 1: Init Firestore doc, then subscribe ────────────────────────────
   useEffect(() => {
     ensureRoundDoc();
-
     const unsubscribe = onSnapshot(ROUND_DOC, (snap) => {
       if (!snap.exists()) return;
-      const data = snap.data();
-      setRoundData(data);         // triggers Step 2 below
-      advancingRef.current = false; // new round confirmed → allow future advance
+      setRoundData(snap.data());
+      advancingRef.current = false;
     });
-
     return () => unsubscribe();
   }, []);
 
-  // ── Step 2: When roundData changes, (re)start the local tick interval ─────
   useEffect(() => {
     if (!roundData) return;
-
-    // Clear any existing interval before starting a new one
     if (intervalRef.current) clearInterval(intervalRef.current);
 
     const { startedAt } = roundData;
 
-    // Tick immediately once, then every second
     const tick = () => {
       const elapsed   = (Date.now() - startedAt) / 1000;
       const remaining = Math.max(0, ROUND_DURATION - elapsed);
+      const floored   = Math.floor(remaining);
 
-      setTimeRemaining(Math.floor(remaining)); // floor = stable, no flicker
-      setVotingOpen(remaining > VOTING_CUTOFF);
+      setTimeRemaining(floored);
+      setPhase(getPhase(floored));
 
-      // Only one user should advance the round
       if (remaining <= 0 && !advancingRef.current) {
         advancingRef.current = true;
         advanceRound(roundData.round);
       }
     };
 
-    tick(); // run immediately to avoid 1-second blank
-    intervalRef.current = setInterval(tick, 1000); // every 1s is enough
+    tick();
+    intervalRef.current = setInterval(tick, 500); // 500ms for smoother phase transitions
 
     return () => clearInterval(intervalRef.current);
-  }, [roundData]); // only re-run when Firestore sends a new round
+  }, [roundData]);
 
   return {
     timeRemaining,
     currentRound: roundData?.round ?? 1,
-    votingOpen,
+    // legacy compat - votingOpen = humans can vote
+    votingOpen:   phase === "voting",
+    phase,        // "voting" | "agents" | "predict"
   };
 }

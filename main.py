@@ -1,6 +1,12 @@
 """
-main.py  — place in project root (same folder as rl_model.py, round_manager.py)
-Run with:  uvicorn main:app --host 0.0.0.0 --port 8000
+main.py  — FastAPI backend
+Run: uvicorn main:app --host 0.0.0.0 --port 8000
+
+Two ways to run this project:
+  A) run_manager integrated (default): uvicorn main:app ... starts the round loop
+  B) standalone agents:  python agent_voter.py (separate process)
+     Both can run simultaneously — agent_voter.py will only fire in the agent window
+     and round_manager.py will skip agents that already voted.
 """
 
 import os
@@ -8,7 +14,6 @@ import sys
 import asyncio
 from contextlib import asynccontextmanager
 
-# Ensure project root is on the path (needed on Windows)
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from fastapi import FastAPI, HTTPException
@@ -18,33 +23,27 @@ import firebase_admin
 from firebase_admin import credentials, firestore as fs
 
 # ── Init Firebase ─────────────────────────────────────────────────────────────
-FIREBASE_CRED = os.getenv("FIREBASE_CREDENTIALS_PATH", "firebase.json")
+FIREBASE_CRED = os.getenv("FIREBASE_CREDENTIALS_PATH", "serviceAccount.json")
 if not firebase_admin._apps:
     cred = credentials.Certificate(FIREBASE_CRED)
     firebase_admin.initialize_app(cred)
 db = fs.client()
 
-# ── Background round manager task ────────────────────────────────────────────
+# ── Background round manager ──────────────────────────────────────────────────
 _manager = None
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     global _manager
     from round_manager import RoundManager
-
     _manager = RoundManager()
-
-    snap = db.collection("gameState").document("currentRound").get()
-    start = snap.to_dict().get("round", 1) if snap.exists else 1
-
-    asyncio.create_task(_manager.run(start_round=start))
+    asyncio.create_task(_manager.run())
     yield
     if _manager:
         _manager.model.save_rl("rl_weights.pkl")
 
 
 app = FastAPI(title="Project NN API", lifespan=lifespan)
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -63,14 +62,13 @@ class VoteRequest(BaseModel):
 
 @app.get("/health")
 def health():
-    return {"status": "ok"}
+    return {"status": "ok", "round": db.collection("gameState").document("currentRound").get().to_dict()}
 
 
 @app.post("/vote")
 def cast_vote(req: VoteRequest):
     if req.color not in ("RED", "GREEN"):
         raise HTTPException(400, "color must be RED or GREEN")
-
     import time
     doc_ref = (
         db.collection("rounds")
@@ -80,7 +78,6 @@ def cast_vote(req: VoteRequest):
     )
     if doc_ref.get().exists:
         raise HTTPException(409, "Already voted this round")
-
     doc_ref.set({
         "userId":           req.userId,
         "color":            req.color,
@@ -104,6 +101,20 @@ def get_metrics(limit: int = 100):
     return {"metrics": rows}
 
 
+@app.get("/results")
+def get_results(limit: int = 20):
+    """Returns last N rounds with prediction, winner, correct flag."""
+    docs = (
+        db.collection("roundResults")
+          .order_by("round", direction=fs.Query.DESCENDING)
+          .limit(limit)
+          .stream()
+    )
+    rows = sorted([d.to_dict() for d in docs if d.to_dict().get("status") == "done"],
+                  key=lambda x: x["round"])
+    return {"results": rows}
+
+
 @app.get("/prediction/{round_num}")
 def get_prediction(round_num: int):
     snap = db.collection("roundResults").document(str(round_num)).get()
@@ -119,16 +130,3 @@ def get_prediction(round_num: int):
         "loss":       d.get("loss"),
         "status":     d.get("status"),
     }
-
-
-@app.get("/results")
-def get_results(limit: int = 20):
-    docs = (
-        db.collection("roundResults")
-          .where("status", "==", "done")
-          .order_by("round", direction=fs.Query.DESCENDING)
-          .limit(limit)
-          .stream()
-    )
-    rows = sorted([d.to_dict() for d in docs], key=lambda x: x["round"])
-    return {"results": rows}

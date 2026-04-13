@@ -1,10 +1,10 @@
-// src/App.jsx  (updated – adds prediction banner + metrics card)
+// src/App.jsx
 import { useState, useEffect, useRef } from "react";
 import {
   collection, doc, getDoc, setDoc, onSnapshot, query, orderBy, limit
 } from "firebase/firestore";
 import { db } from "./firebase";
-import { useRoundTimer, ROUND_DURATION } from "./useRoundTimer";
+import { useRoundTimer, ROUND_DURATION, HUMAN_CUTOFF, AGENT_CUTOFF } from "./useRoundTimer";
 import { useMetrics } from "./useMetrics";
 import MetricsChart from "./MetricsChart";
 import { v4 as uuidv4 } from "uuid";
@@ -29,11 +29,8 @@ const INFLUENCE_OPTIONS = [
   { value: "no",      label: "No" },
 ];
 
-// ─── API base URL – change to your backend URL in production ─────────────────
-const API_BASE = import.meta.env.VITE_API_BASE || "http://localhost:8000";
-
 export default function App() {
-  const { timeRemaining, currentRound, votingOpen } = useRoundTimer();
+  const { timeRemaining, currentRound, votingOpen, phase } = useRoundTimer();
   const metrics = useMetrics(100);
 
   const [hasVoted,         setHasVoted]         = useState(false);
@@ -42,150 +39,222 @@ export default function App() {
   const [influenceHistory, setInfluenceHistory] = useState("neutral");
   const [redVotes,         setRedVotes]         = useState(0);
   const [greenVotes,       setGreenVotes]       = useState(0);
-  const [roundWinner,      setRoundWinner]      = useState(null);
-  const [roundHistory,     setRoundHistory]     = useState([]);
-  const [prediction,       setPrediction]       = useState(null);
-  const [humanCount,       setHumanCount]       = useState(0);
   const [voterList,        setVoterList]        = useState([]);
+  const [humanCount,       setHumanCount]       = useState(0);
+  const [roundWinner,      setRoundWinner]      = useState(null);
+  const [prediction,       setPrediction]       = useState(null);
+  const [predCorrect,      setPredCorrect]      = useState(null);
+  const [roundHistory,     setRoundHistory]     = useState([]);  // last 5 completed rounds
 
   const prevRoundRef = useRef(currentRound);
   const winnerRef    = useRef(null);
+  const redRef       = useRef(0);
+  const greenRef     = useRef(0);
 
-  // Live vote count
+  // ── Load last 5 completed rounds on mount ─────────────────────────────
   useEffect(() => {
     if (!currentRound) return;
-    const votesCol = collection(db, "rounds", String(currentRound), "votes");
-    const unsub = onSnapshot(query(votesCol), (snap) => {
-      let red = 0, green = 0, humans = 0;
-      snap.forEach((d) => {
-        const data = d.data();
-        if (data.color === "RED") red++; else green++;
-        if (!data.isAgent) humans++;
-      });
-      setRedVotes(red);
-      setGreenVotes(green);
-      setHumanCount(humans);
-      // Build sorted voter list: humans first, then agents
-      const allVoters = [];
-      snap.forEach((d) => allVoters.push(d.data()));
-      allVoters.sort((a, b) => (a.isAgent ? 1 : -1) - (b.isAgent ? 1 : -1));
-      setVoterList(allVoters);
-    });
+    const load = async () => {
+      const rows = [];
+      for (let rnum = Math.max(1, currentRound - 5); rnum < currentRound; rnum++) {
+        try {
+          const snap = await getDoc(doc(db, "roundResults", String(rnum)));
+          if (snap.exists()) {
+            const d = snap.data();
+            if (d.winner) rows.push({
+              round:      rnum,
+              winner:     d.winner,
+              red:        d.redVotes    || 0,
+              green:      d.greenVotes  || 0,
+              prediction: d.prediction  || null,
+              correct:    d.correct     ?? null,
+              accuracy:   d.accuracy    ?? null,
+            });
+          }
+        } catch (_) {}
+      }
+      rows.sort((a, b) => b.round - a.round);
+      setRoundHistory(rows.slice(0, 5));
+    };
+    load();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  // ── Live vote listener ─────────────────────────────────────────────────
+  useEffect(() => {
+    if (!currentRound) return;
+    const unsub = onSnapshot(
+      collection(db, "rounds", String(currentRound), "votes"),
+      (snap) => {
+        let red = 0, green = 0, humans = 0;
+        const voters = [];
+        snap.forEach((d) => {
+          const v = d.data();
+          if (v.color === "RED") red++; else green++;
+          if (!v.isAgent) humans++;
+          voters.push(v);
+        });
+        voters.sort((a, b) => (!a.isAgent && b.isAgent ? -1 : a.isAgent && !b.isAgent ? 1 : 0));
+        setRedVotes(red); setGreenVotes(green);
+        setHumanCount(humans); setVoterList(voters);
+        redRef.current = red; greenRef.current = green;
+      }
+    );
     return () => unsub();
   }, [currentRound]);
 
-  // Load prediction for current round
+  // ── Live prediction + result ───────────────────────────────────────────
   useEffect(() => {
     if (!currentRound) return;
-    const ref = doc(db, "roundResults", String(currentRound));
-    const unsub = onSnapshot(ref, (snap) => {
-      if (snap.exists()) {
-        const d = snap.data();
-        setPrediction(d.prediction || null);
-        if (d.winner) setRoundWinner(d.winner);
+    const unsub = onSnapshot(doc(db, "roundResults", String(currentRound)), (snap) => {
+      if (!snap.exists()) return;
+      const d = snap.data();
+      setPrediction(d.prediction || null);
+      if (d.winner) {
+        setRoundWinner(d.winner);
+        winnerRef.current = d.winner;
+        setPredCorrect(d.prediction != null ? d.prediction === d.winner : null);
       }
     });
     return () => unsub();
   }, [currentRound]);
 
-  // Check if already voted
+  // ── Check if already voted ─────────────────────────────────────────────
   useEffect(() => {
     if (!currentRound) return;
-    const voteDoc = doc(db, "rounds", String(currentRound), "votes", USER_ID);
-    getDoc(voteDoc).then((snap) => {
+    getDoc(doc(db, "rounds", String(currentRound), "votes", USER_ID)).then((snap) => {
       if (snap.exists()) {
         const d = snap.data();
-        setHasVoted(true);
-        setUserVote(d.color);
+        setHasVoted(true); setUserVote(d.color);
         setEmotionFeel(d.emotionFeel || "neutral");
         setInfluenceHistory(d.influenceHistory || "neutral");
       } else {
-        setHasVoted(false);
-        setUserVote(null);
+        setHasVoted(false); setUserVote(null);
       }
     });
   }, [currentRound]);
 
-  // Voting closed
+  // ── Round transition ───────────────────────────────────────────────────
   useEffect(() => {
-    if (!votingOpen) {
-      const w = redVotes > greenVotes ? "RED" : greenVotes > redVotes ? "GREEN" : "TIE";
-      winnerRef.current = w;
+    if (!currentRound || currentRound === prevRoundRef.current) {
+      if (prevRoundRef.current == null) prevRoundRef.current = currentRound;
+      return;
     }
-  }, [votingOpen]);
 
-  // Round transition
-  useEffect(() => {
-    if (currentRound !== prevRoundRef.current) {
-      const finished = prevRoundRef.current;
-      const winner   = winnerRef.current;
-      if (winner) {
-        setRoundHistory((prev) =>
-          [{ round: finished, winner, red: redVotes, green: greenVotes }, ...prev].slice(0, 5)
-        );
+    const finished = prevRoundRef.current;
+    getDoc(doc(db, "roundResults", String(finished))).then((snap) => {
+      let winner = winnerRef.current;
+      let red    = redRef.current;
+      let green  = greenRef.current;
+      let prediction_val = null;
+      let correct_val    = null;
+      let accuracy_val   = null;
+
+      if (snap.exists()) {
+        const d = snap.data();
+        if (d.winner)     winner         = d.winner;
+        if (d.redVotes)   red            = d.redVotes;
+        if (d.greenVotes) green          = d.greenVotes;
+        prediction_val = d.prediction  || null;
+        correct_val    = d.correct     ?? null;
+        accuracy_val   = d.accuracy    ?? null;
       }
-      setHasVoted(false); setUserVote(null); setRoundWinner(null);
-      setEmotionFeel("neutral"); setInfluenceHistory("neutral");
-      setPrediction(null);
-      setVoterList([]);
-      winnerRef.current = null;
-      prevRoundRef.current = currentRound;
-    }
+
+      if (!winner) winner = red > green ? "RED" : green > red ? "GREEN" : "TIE";
+
+      setRoundHistory((prev) => {
+        const entry = { round: finished, winner, red, green,
+                        prediction: prediction_val, correct: correct_val, accuracy: accuracy_val };
+        return [entry, ...prev.filter(r => r.round !== finished)].slice(0, 5);
+      });
+    }).catch(() => {
+      const winner = winnerRef.current || (redRef.current > greenRef.current ? "RED"
+                   : greenRef.current > redRef.current ? "GREEN" : "TIE");
+      setRoundHistory((prev) =>
+        [{ round: finished, winner, red: redRef.current, green: greenRef.current,
+           prediction: null, correct: null, accuracy: null },
+         ...prev.filter(r => r.round !== finished)].slice(0, 5)
+      );
+    });
+
+    // Reset for new round
+    setHasVoted(false); setUserVote(null); setRoundWinner(null);
+    setPrediction(null); setPredCorrect(null);
+    setEmotionFeel("neutral"); setInfluenceHistory("neutral");
+    setVoterList([]); setRedVotes(0); setGreenVotes(0); setHumanCount(0);
+    winnerRef.current = null;
+    prevRoundRef.current = currentRound;
   }, [currentRound]);
 
   async function castVote(color) {
     if (!votingOpen || hasVoted) return;
     setHasVoted(true); setUserVote(color);
     try {
-      // Write directly to Firestore (backend reads it)
-      const voteDoc = doc(db, "rounds", String(currentRound), "votes", USER_ID);
-      await setDoc(voteDoc, {
-        userId: USER_ID, color,
-        emotionFeel, influenceHistory,
-        isAgent: false,
-        votedAt: Date.now(),
+      await setDoc(doc(db, "rounds", String(currentRound), "votes", USER_ID), {
+        userId: USER_ID, color, emotionFeel, influenceHistory,
+        isAgent: false, votedAt: Date.now(),
       });
-    } catch (e) {
-      setHasVoted(false); setUserVote(null);
-    }
+    } catch (e) { setHasVoted(false); setUserVote(null); }
   }
 
   const timerPct      = (timeRemaining / ROUND_DURATION) * 100;
-  const timerColor    = timeRemaining > ROUND_DURATION * 0.67 ? "#4a7c59"
-                      : timeRemaining > ROUND_DURATION * 0.33 ? "#c17f3e" : "#c0392b";
+  const timerColor    = phase === "voting"  ? "#4a7c59"
+                      : phase === "agents"  ? "#c17f3e"
+                      :                       "#c0392b";
   const circumference = 2 * Math.PI * 52;
+
+  // Phase label for the UI
+  const phaseLabel = phase === "voting"  ? { text: "VOTING OPEN",      cls: "phase-voting"  }
+                   : phase === "agents"  ? { text: "AGENTS VOTING…",   cls: "phase-agents"  }
+                   :                       { text: "COMPUTING MODEL…", cls: "phase-predict" };
 
   return (
     <div className="app">
       <NeuralBg />
 
-      {/* ── Main voting card ─────────────────────────────────────── */}
+      {/* ── Main voting card ──────────────────────────────────────────── */}
       <div className="card main-card">
         <div className="nn-label">◈ NEURAL NETWORK VOTING SYSTEM</div>
         <h1>Project NN</h1>
         <h3>Round <span className="round-badge">#{currentRound}</span></h3>
 
-        {/* Prediction banner */}
-        {prediction && (
-          <div className={`prediction-banner prediction-${prediction.toLowerCase()}`}>
-            🧠 HMNN Predicts: <strong>{prediction}</strong>
-            {roundWinner && (
-              <span className="prediction-result">
-                &nbsp;— Actual: <strong>{roundWinner}</strong>
-                {prediction === roundWinner ? " ✅" : " ❌"}
-              </span>
-            )}
-          </div>
-        )}
+        {/* Phase indicator */}
+        <div className={`phase-indicator ${phaseLabel.cls}`}>
+          {phaseLabel.text}
+          <span className="phase-time"> · {timeRemaining}s</span>
+        </div>
 
-        {/* Human voter count */}
-        <div className="voter-count">
-          👤 <strong>{humanCount}</strong> human{humanCount !== 1 ? "s" : ""} voted
-          {humanCount < 12 && votingOpen && (
-            <span className="agent-fill"> · {12 - humanCount} agent slots available</span>
+        {/* ── HMNN Prediction — only visible in "predict" phase ────── */}
+        <div className={`prediction-panel ${phase === "predict" || roundWinner ? "pred-visible" : "pred-hidden"}`}>
+          <div className="pred-header">🧠 HMNN PREDICTION</div>
+          {prediction ? (
+            <div className={`pred-value-big ${prediction === "RED" ? "pred-red" : "pred-green"}`}>
+              {prediction === "RED" ? "🔴 RED" : "🟢 GREEN"}
+              {roundWinner && (
+                <span className={`pred-outcome ${predCorrect ? "pred-correct" : "pred-wrong"}`}>
+                  {predCorrect ? " ✅ CORRECT" : " ❌ WRONG"}
+                </span>
+              )}
+            </div>
+          ) : (
+            <div className="pred-computing">
+              {phase === "predict" ? "⏳ Computing from last 5 rounds…" : "—"}
+            </div>
           )}
         </div>
 
+        {/* Human count */}
+        <div className="voter-count">
+          👤 <strong>{humanCount}</strong> human{humanCount !== 1 ? "s" : ""} voted
+          {phase === "agents" && (
+            <span className="agent-fill"> · 🤖 agents voting now…</span>
+          )}
+          {phase === "voting" && humanCount < 12 && (
+            <span className="agent-fill"> · agents fill remaining slots at 10s</span>
+          )}
+        </div>
+
+        {/* Timer ring */}
         <div className="timer-ring-wrap">
           <svg className="timer-ring" viewBox="0 0 120 120">
             <circle cx="60" cy="60" r="52" fill="none" stroke="#e8e0d4" strokeWidth="6" />
@@ -201,51 +270,65 @@ export default function App() {
           </div>
         </div>
 
+        {/* Dropdowns — disabled once voting closes */}
         <div className="dropdowns-row">
           <div className="dropdown-group">
             <label className="dropdown-label">Emotion Feel</label>
             <select className="dropdown-select" value={emotionFeel}
-              onChange={(e) => setEmotionFeel(e.target.value)} disabled={hasVoted || !votingOpen}>
+              onChange={(e) => setEmotionFeel(e.target.value)}
+              disabled={hasVoted || !votingOpen}>
               {EMOTION_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           </div>
           <div className="dropdown-group">
-            <label className="dropdown-label">Influence from History</label>
+            <label className="dropdown-label">Influenced by History</label>
             <select className="dropdown-select" value={influenceHistory}
-              onChange={(e) => setInfluenceHistory(e.target.value)} disabled={hasVoted || !votingOpen}>
+              onChange={(e) => setInfluenceHistory(e.target.value)}
+              disabled={hasVoted || !votingOpen}>
               {INFLUENCE_OPTIONS.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
             </select>
           </div>
         </div>
 
+        {/* Status message */}
         {hasVoted ? (
           <div className={`voted-message ${userVote === "RED" ? "voted-red" : "voted-green"}`}>
-            ✅ Voted <strong>{userVote}</strong> · Emotion: <strong>{EMOTION_OPTIONS.find(o => o.value === emotionFeel)?.label}</strong> · History: <strong>{INFLUENCE_OPTIONS.find(o => o.value === influenceHistory)?.label}</strong>
+            ✅ Voted <strong>{userVote}</strong>
+            &nbsp;· Emotion: <strong>{EMOTION_OPTIONS.find(o => o.value === emotionFeel)?.label}</strong>
+            &nbsp;· History: <strong>{INFLUENCE_OPTIONS.find(o => o.value === influenceHistory)?.label}</strong>
           </div>
-        ) : votingOpen ? (
-          <p className="info">🗳 Select your options and cast your vote</p>
+        ) : phase === "voting" ? (
+          <p className="info">🗳 Select your options and cast your vote below</p>
+        ) : phase === "agents" ? (
+          <p className="warning">⛔ Human voting closed — agents are voting…</p>
         ) : (
-          <p className="warning">⛔ Voting Closed — counting results…</p>
+          <p className="warning">⛔ All voting closed — model is computing…</p>
         )}
 
-        {!votingOpen && roundWinner && (
+        {/* Winner box (after round ends) */}
+        {roundWinner && (
           <div className={`winner-box winner-${roundWinner.toLowerCase()}`}>
-            {roundWinner === "TIE" ? "⚖️ It's a TIE!" : roundWinner === "RED" ? "🔴 RED Wins!" : "🟢 GREEN Wins!"}
+            {roundWinner === "TIE" ? "⚖️ It's a TIE!"
+             : roundWinner === "RED" ? "🔴 RED Wins!" : "🟢 GREEN Wins!"}
           </div>
         )}
 
+        {/* Vote buttons */}
         <div className="button-row">
-          <button className="vote-btn red-btn" onClick={() => castVote("RED")} disabled={!votingOpen || hasVoted}>
+          <button className="vote-btn red-btn"
+            onClick={() => castVote("RED")} disabled={!votingOpen || hasVoted}>
             <span className="btn-icon">🔴</span>
             <span className="btn-label">RED</span>
           </button>
-          <button className="vote-btn green-btn" onClick={() => castVote("GREEN")} disabled={!votingOpen || hasVoted}>
+          <button className="vote-btn green-btn"
+            onClick={() => castVote("GREEN")} disabled={!votingOpen || hasVoted}>
             <span className="btn-icon">🟢</span>
             <span className="btn-label">GREEN</span>
           </button>
         </div>
 
-        {!votingOpen && (
+        {/* Vote tally — visible in agents + predict phases or after winner */}
+        {(phase !== "voting" || roundWinner) && (redVotes + greenVotes) > 0 && (
           <div className="stats">
             <div className="metric">
               <span className="metric-label">RED</span>
@@ -265,51 +348,83 @@ export default function App() {
         )}
       </div>
 
-      {/* ── Voter list after round ends ───────────────────────────── */}
-      {!votingOpen && voterList.length > 0 && (
+      {/* ── Voter list ────────────────────────────────────────────────── */}
+      {phase !== "voting" && voterList.length > 0 && (
         <div className="card voter-list-card">
-          <div className="nn-label">◈ ALL VOTES THIS ROUND ({voterList.length}/12)</div>
+          <div className="nn-label">◈ VOTES THIS ROUND ({voterList.length}/12)</div>
           <div className="voter-list">
             {voterList.map((v, i) => (
               <div key={v.userId || i} className={`voter-row voter-${v.color?.toLowerCase()}`}>
-                <span className="voter-name">
-                  {v.isAgent ? "🤖" : "👤"} {v.agentName || "You"}
-                </span>
+                <span className="voter-name">{v.isAgent ? "🤖" : "👤"} {v.agentName || "You"}</span>
                 <span className={`voter-color badge-${v.color?.toLowerCase()}`}>
                   {v.color === "RED" ? "🔴 RED" : "🟢 GREEN"}
                 </span>
-                <span className="voter-meta">
-                  {v.emotionFeel} · {v.influenceHistory}
-                </span>
+                <span className="voter-meta">{v.emotionFeel} · {v.influenceHistory}</span>
               </div>
             ))}
           </div>
         </div>
       )}
 
-      {/* ── Live metrics chart card ───────────────────────────────── */}
+      {/* ── Last 5 results: Actual vs Model ──────────────────────────── */}
+      {roundHistory.length > 0 && (
+        <div className="card history-card">
+          <div className="history-title">◈ LAST {roundHistory.length} ROUNDS — ACTUAL vs MODEL</div>
+          <div className="results-table">
+            <div className="results-header">
+              <span>Round</span>
+              <span>Votes</span>
+              <span>Actual</span>
+              <span>Model</span>
+              <span>Result</span>
+            </div>
+            {roundHistory.map((r) => (
+              <div key={r.round} className={`results-row winner-${r.winner.toLowerCase()}`}>
+                <span className="res-round">#{r.round}</span>
+                <span className="res-votes">
+                  <span className="red-text">🔴{r.red}</span>
+                  <span> — </span>
+                  <span className="green-text">🟢{r.green}</span>
+                </span>
+                <span className={`res-actual badge-${r.winner.toLowerCase()}`}>
+                  {r.winner}
+                </span>
+                <span className={`res-pred ${
+                  r.prediction == null ? "pred-none"
+                  : r.prediction === "RED" ? "badge-red" : "badge-green"
+                }`}>
+                  {r.prediction || "—"}
+                </span>
+                <span className="res-outcome">
+                  {r.correct === true  ? "✅" :
+                   r.correct === false ? "❌" : "—"}
+                </span>
+              </div>
+            ))}
+          </div>
+
+          {/* Running accuracy from last 5 */}
+          {roundHistory.some(r => r.correct !== null) && (() => {
+            const scored  = roundHistory.filter(r => r.correct !== null);
+            const correct = scored.filter(r => r.correct).length;
+            const pct     = Math.round((correct / scored.length) * 100);
+            return (
+              <div className="accuracy-strip">
+                Model accuracy (last {scored.length}): &nbsp;
+                <strong style={{ color: pct >= 60 ? "#2e7d32" : pct >= 40 ? "#c17f3e" : "#c0392b" }}>
+                  {correct}/{scored.length} = {pct}%
+                </strong>
+              </div>
+            );
+          })()}
+        </div>
+      )}
+
+      {/* ── Live model performance chart ──────────────────────────────── */}
       <div className="card metrics-card">
         <div className="nn-label">◈ LIVE MODEL PERFORMANCE</div>
         <MetricsChart metrics={metrics} />
       </div>
-
-      {/* ── Round history ────────────────────────────────────────── */}
-      {roundHistory.length > 0 && (
-        <div className="card history-card">
-          <div className="history-title">◈ Past Round Results</div>
-          <div className="history-list">
-            {roundHistory.map((r) => (
-              <div key={r.round} className={`history-row winner-${r.winner.toLowerCase()}`}>
-                <span className="h-round">Round #{r.round}</span>
-                <span className="h-votes">🔴 {r.red} — 🟢 {r.green}</span>
-                <span className={`h-winner badge-${r.winner.toLowerCase()}`}>
-                  {r.winner === "TIE" ? "⚖️ TIE" : r.winner === "RED" ? "🔴 RED" : "🟢 GREEN"}
-                </span>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
     </div>
   );
 }
@@ -318,21 +433,20 @@ function NeuralBg() {
   const canvasRef = useRef(null);
   useEffect(() => {
     const canvas = canvasRef.current;
-    const ctx = canvas.getContext("2d");
+    const ctx    = canvas.getContext("2d");
     let animId;
-    const nodes = [];
+    const nodes  = [];
     function resize() { canvas.width = window.innerWidth; canvas.height = window.innerHeight; }
     resize();
     window.addEventListener("resize", resize);
-    for (let i = 0; i < 28; i++) {
+    for (let i = 0; i < 28; i++)
       nodes.push({ x: Math.random()*window.innerWidth, y: Math.random()*window.innerHeight,
         vx: (Math.random()-0.5)*0.4, vy: (Math.random()-0.5)*0.4, r: 2+Math.random()*3 });
-    }
     function draw() {
       ctx.clearRect(0, 0, canvas.width, canvas.height);
       nodes.forEach((n) => {
         n.x += n.vx; n.y += n.vy;
-        if (n.x < 0 || n.x > canvas.width) n.vx *= -1;
+        if (n.x < 0 || n.x > canvas.width)  n.vx *= -1;
         if (n.y < 0 || n.y > canvas.height) n.vy *= -1;
       });
       for (let i = 0; i < nodes.length; i++)

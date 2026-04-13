@@ -1,12 +1,12 @@
 """
 round_manager.py
-Orchestrates each voting round:
-  1. Make HMNN prediction
-  2. Wait VOTE_WINDOW seconds for human votes
-  3. Fill remaining slots with AI agents (OpenAI or fallback)
-  4. Write ALL 12 votes to Firestore
-  5. Tally, update RL, write results
-  6. Advance round counter
+Orchestrates each voting round with a 3-phase timing model:
+
+  Phase 1 — Human voting   (0s  → 20s): humans cast votes via the web UI
+  Phase 2 — Agent voting   (20s → 25s): AI agents cast their votes
+  Phase 3 — Prediction     (25s → 30s): HMNN computes & publishes prediction,
+                                         frontend displays it in the last 5s
+  End of round             (30s)       : tally, RL update, metrics, advance round
 """
 
 import asyncio
@@ -26,12 +26,19 @@ try:
 except ImportError:
     _HAS_OPENAI = False
 
-# ─── Config ───────────────────────────────────────────────────────────────────
-ROUND_DURATION = 30
-VOTE_WINDOW    = 25
-TOTAL_VOTES    = 12
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-FIREBASE_CRED  = os.getenv("FIREBASE_CREDENTIALS_PATH", "serviceAccount.json")
+# ─── Timing Config ────────────────────────────────────────────────────────────
+ROUND_DURATION   = 30   # total round length (seconds)
+HUMAN_CUTOFF     = 10   # humans stop voting when 10s remain  (at t=20s)
+AGENT_WINDOW     = 5    # agents have 5s to vote              (t=20s → t=25s)
+PREDICT_WINDOW   = 5    # prediction shown in last 5s         (t=25s → t=30s)
+
+HUMAN_VOTE_TIME  = ROUND_DURATION - HUMAN_CUTOFF   # 20s  — wait for humans
+AGENT_END_TIME   = ROUND_DURATION - (HUMAN_CUTOFF - AGENT_WINDOW)  # 25s
+# After AGENT_END_TIME we compute, write prediction, then sleep remaining
+
+TOTAL_VOTES      = 12
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY", "")
+FIREBASE_CRED    = os.getenv("FIREBASE_CREDENTIALS_PATH", "serviceAccount.json")
 
 EMOTION_OPTIONS   = ["very_low", "low", "neutral", "strong", "very_strong"]
 INFLUENCE_OPTIONS = ["no", "neutral", "yes"]
@@ -59,7 +66,7 @@ def init_firebase():
         firebase_admin.initialize_app(cred)
     return firestore.client()
 
-# ─── Agent decisions ──────────────────────────────────────────────────────────
+# ─── Agent decision via OpenAI ────────────────────────────────────────────────
 async def _agent_openai(agent: dict, history: list[dict]) -> dict:
     client   = AsyncOpenAI(api_key=OPENAI_API_KEY)
     hist_str = json.dumps(history[-5:]) if history else "[]"
@@ -117,14 +124,16 @@ class RoundManager:
         self.db           = init_firebase()
         self.model        = RLModel("HMNN.pkl")
         self.model.load_rl("rl_weights.pkl")
-        self.round_history: list[dict] = []
-        self.window:        list[dict] = []
+        self.round_history: list[dict] = []   # aggregate round results
+        self.window:        list[dict] = []   # voter-matrix window for HMNN
 
+    # ── Bootstrap: load last 5 completed rounds from Firestore ───────────
     async def bootstrap(self):
         snap = self.db.collection("gameState").document("currentRound").get()
         if not snap.exists:
             return
         current = snap.to_dict().get("round", 1)
+        print(f"[Bootstrap] Current round: {current}")
         for rnum in range(max(1, current - 5), current):
             try:
                 rs = self.db.collection("roundResults").document(str(rnum)).get()
@@ -136,58 +145,94 @@ class RoundManager:
                         "red":    d.get("redVotes", 0),
                         "winner": d.get("winner", "RED"),
                     })
-            except Exception:
-                pass
+                    print(f"  Loaded round {rnum}: {d.get('winner')}")
+            except Exception as e:
+                print(f"  Bootstrap error round {rnum}: {e}")
 
+    # ── Main round orchestration ──────────────────────────────────────────
     async def run_round(self, round_num: int):
-        print(f"\n[RoundManager] ── Round {round_num} ──")
+        round_start = time.time()
+        print(f"\n{'='*50}")
+        print(f"[Round {round_num}] START — {time.strftime('%H:%M:%S')}")
+        print(f"{'='*50}")
 
-        # 1. Predict before voting starts
-        prediction = self.model.predict(self.window, self.round_history)
-        self._write_prediction(round_num, prediction)
-        print(f"  Prediction: {prediction}")
+        # ── Phase 1: Wait for human votes (0s → 20s) ─────────────────────
+        print(f"[Round {round_num}] Phase 1: Human voting open (0s → {HUMAN_VOTE_TIME}s)")
+        await asyncio.sleep(HUMAN_VOTE_TIME)
 
-        # 2. Wait for human votes
-        await asyncio.sleep(VOTE_WINDOW)
+        # ── Phase 2: Agent voting (20s → 25s) ────────────────────────────
+        print(f"[Round {round_num}] Phase 2: Agent voting ({HUMAN_VOTE_TIME}s → {AGENT_END_TIME}s)")
 
-        # 3. Read human votes (no .where() filter — read all then filter in Python)
+        # Read current human votes first
         human_votes = self._read_human_votes(round_num)
-        print(f"  Human votes: {len(human_votes)}")
+        print(f"  Human votes collected: {len(human_votes)}")
 
-        # 4. Fill remaining with agents
+        # Determine how many agents needed
         n_needed   = max(0, TOTAL_VOTES - len(human_votes))
         agent_pool = random.sample(AGENTS, n_needed) if n_needed else []
-        decisions  = await asyncio.gather(*[
-            get_agent_decision(a, self.round_history) for a in agent_pool
-        ])
+        print(f"  Agents needed: {n_needed}")
 
-        # 5. Build agent vote dicts
-        agent_votes = [
-            {
-                "userId":           a["id"],
-                "agentName":        a["name"],
-                "color":            d["color"],
-                "emotionFeel":      d["emotionFeel"],
-                "influenceHistory": d["influenceHistory"],
-                "isAgent":          True,
-                "votedAt":          int(time.time() * 1000),
-            }
-            for a, d in zip(agent_pool, decisions)
-        ]
+        # Fire all agent decisions concurrently (they have 5s)
+        agent_task = asyncio.create_task(
+            self._get_all_agent_decisions(agent_pool, round_num)
+        )
 
-        # 6. Write all agent votes to Firestore
-        for v in agent_votes:
-            self._write_vote(round_num, v["userId"], v)
+        # Wait for agent window to finish
+        elapsed   = time.time() - round_start
+        remaining = max(0, AGENT_END_TIME - elapsed)
+        await asyncio.sleep(remaining)
+
+        # Collect agent results (should be done by now, but await with timeout)
+        try:
+            agent_votes = await asyncio.wait_for(agent_task, timeout=3.0)
+        except asyncio.TimeoutError:
+            agent_votes = []
+            print("  WARNING: Agent voting timed out, using fallback")
+            agent_votes = self._fallback_agent_votes(agent_pool, round_num)
+
         print(f"  Agent votes written: {len(agent_votes)}")
 
-        # 7. Tally
-        all_votes = human_votes + agent_votes
+        # ── Phase 3: HMNN Prediction (25s → 30s) ─────────────────────────
+        print(f"[Round {round_num}] Phase 3: Computing HMNN prediction ({AGENT_END_TIME}s → {ROUND_DURATION}s)")
+
+        # Re-read all votes now that agents have voted
+        human_votes_final = self._read_human_votes(round_num)
+        all_votes_so_far  = human_votes_final + agent_votes
+
+        # Build current round's voter matrix for HMNN (use what we have)
+        if len(all_votes_so_far) > 0:
+            current_matrix = {
+                "votes": [
+                    encode_vote(v["color"], v["emotionFeel"], v["influenceHistory"])
+                    for v in all_votes_so_far
+                ],
+                "result": None,  # unknown yet
+            }
+            window_for_predict = self.window + [current_matrix]
+        else:
+            window_for_predict = self.window
+
+        # Compute prediction using last 5 rounds of history + current partial data
+        prediction = self.model.predict(window_for_predict, self.round_history)
+        print(f"  HMNN Prediction: {prediction}")
+
+        # Write prediction to Firestore — frontend will display it
+        self._write_prediction(round_num, prediction)
+
+        # Wait out the remaining prediction window
+        elapsed   = time.time() - round_start
+        remaining = max(0, ROUND_DURATION - elapsed)
+        if remaining > 0:
+            await asyncio.sleep(remaining)
+
+        # ── Tally ─────────────────────────────────────────────────────────
+        all_votes = self._read_all_votes(round_num)
         red   = sum(1 for v in all_votes if v["color"] == "RED")
         green = sum(1 for v in all_votes if v["color"] == "GREEN")
-        winner = "RED" if red > green else "GREEN"
-        print(f"  Total={len(all_votes)} RED={red} GREEN={green} → {winner}")
+        winner = "RED" if red > green else "GREEN" if green > red else "TIE"
+        print(f"  TALLY: RED={red} GREEN={green} → WINNER={winner}")
 
-        # 8. HMNN voter matrix
+        # ── Build voter matrix for HMNN update ───────────────────────────
         voter_matrix = {
             "votes": [
                 encode_vote(v["color"], v["emotionFeel"], v["influenceHistory"])
@@ -199,53 +244,111 @@ class RoundManager:
         if len(self.window) > 5:
             self.window.pop(0)
 
-        # 9. RL update
+        # ── RL update (now that we know the actual winner) ────────────────
         metrics = self.model.update(winner)
-        print(f"  Metrics: acc={metrics.get('accuracy')} loss={metrics.get('loss')}")
+        print(f"  Metrics: acc={metrics.get('accuracy')} loss={metrics.get('loss')} correct={metrics.get('correct')}")
 
-        # 10. Write to Firestore
+        # ── Write results to Firestore ────────────────────────────────────
         self._write_result(round_num, red, green, winner, prediction, metrics)
         self._write_metrics(round_num, metrics)
         self.model.save_rl("rl_weights.pkl")
 
-        # 11. Local history
+        # ── Update local history ──────────────────────────────────────────
         self.round_history.append({
-            "round": round_num, "green": green, "red": red, "winner": winner,
+            "round":  round_num,
+            "green":  green,
+            "red":    red,
+            "winner": winner,
         })
+        # Keep only last 5
+        if len(self.round_history) > 5:
+            self.round_history = self.round_history[-5:]
 
-        # 12. Advance round after remaining time
-        await asyncio.sleep(ROUND_DURATION - VOTE_WINDOW)
+        # ── Advance round ─────────────────────────────────────────────────
         self._advance_round(round_num)
+        print(f"[Round {round_num}] COMPLETE → advanced to round {round_num + 1}")
+
+    # ── Get all agent decisions and write them concurrently ───────────────
+    async def _get_all_agent_decisions(self, agent_pool: list, round_num: int) -> list:
+        if not agent_pool:
+            return []
+
+        decisions = await asyncio.gather(*[
+            get_agent_decision(a, self.round_history) for a in agent_pool
+        ])
+
+        agent_votes = []
+        for agent, decision in zip(agent_pool, decisions):
+            vote = {
+                "userId":           agent["id"],
+                "agentName":        agent["name"],
+                "color":            decision["color"],
+                "emotionFeel":      decision["emotionFeel"],
+                "influenceHistory": decision["influenceHistory"],
+                "isAgent":          True,
+                "votedAt":          int(time.time() * 1000),
+            }
+            self._write_vote(round_num, agent["id"], vote)
+            agent_votes.append(vote)
+
+        return agent_votes
+
+    def _fallback_agent_votes(self, agent_pool: list, round_num: int) -> list:
+        votes = []
+        for agent in agent_pool:
+            d = _agent_fallback(agent, self.round_history)
+            vote = {
+                "userId":           agent["id"],
+                "agentName":        agent["name"],
+                "color":            d["color"],
+                "emotionFeel":      d["emotionFeel"],
+                "influenceHistory": d["influenceHistory"],
+                "isAgent":          True,
+                "votedAt":          int(time.time() * 1000),
+            }
+            self._write_vote(round_num, agent["id"], vote)
+            votes.append(vote)
+        return votes
 
     # ── Firestore helpers ─────────────────────────────────────────────────
     def _read_human_votes(self, round_num: int) -> list[dict]:
-        # Read ALL votes then filter in Python to avoid Firestore index issues
         ref  = self.db.collection("rounds").document(str(round_num)).collection("votes")
         snap = ref.get()
         return [d.to_dict() for d in snap if not d.to_dict().get("isAgent", False)]
+
+    def _read_all_votes(self, round_num: int) -> list[dict]:
+        ref  = self.db.collection("rounds").document(str(round_num)).collection("votes")
+        snap = ref.get()
+        return [d.to_dict() for d in snap]
 
     def _write_vote(self, round_num: int, user_id: str, data: dict):
         self.db.collection("rounds").document(str(round_num)) \
                .collection("votes").document(user_id).set(data)
 
     def _write_prediction(self, round_num: int, prediction: str):
+        """Write prediction so frontend can show it in last 5 seconds."""
         self.db.collection("roundResults").document(str(round_num)).set(
-            {"prediction": prediction, "status": "pending"}, merge=True,
+            {
+                "prediction": prediction,
+                "status":     "predicting",
+                "predictedAt": int(time.time() * 1000),
+            },
+            merge=True,
         )
 
     def _write_result(self, round_num, red, green, winner, prediction, metrics):
         self.db.collection("roundResults").document(str(round_num)).set({
-            "round":      round_num,
-            "redVotes":   red,
-            "greenVotes": green,
-            "winner":     winner,
-            "prediction": prediction,
-            "correct":    metrics.get("correct", False),
-            "reward":     metrics.get("reward", 0),
-            "accuracy":   metrics.get("accuracy", 0),
-            "loss":       metrics.get("loss", 1),
-            "timestamp":  int(time.time() * 1000),
-            "status":     "done",
+            "round":       round_num,
+            "redVotes":    red,
+            "greenVotes":  green,
+            "winner":      winner,
+            "prediction":  prediction,
+            "correct":     metrics.get("correct", False),
+            "reward":      metrics.get("reward", 0),
+            "accuracy":    metrics.get("accuracy", 0),
+            "loss":        metrics.get("loss", 1),
+            "timestamp":   int(time.time() * 1000),
+            "status":      "done",
         })
 
     def _write_metrics(self, round_num: int, metrics: dict):
@@ -266,8 +369,13 @@ class RoundManager:
 
     async def run(self, start_round: int = 1, total_rounds: int = 10_000):
         await self.bootstrap()
+        snap = self.db.collection("gameState").document("currentRound").get()
+        if snap.exists:
+            start_round = snap.to_dict().get("round", 1)
+        print(f"\n[RoundManager] Starting from round {start_round}")
         for rnum in range(start_round, start_round + total_rounds):
             await self.run_round(rnum)
+
 
 if __name__ == "__main__":
     manager = RoundManager()
