@@ -226,19 +226,19 @@ export default function App() {
 
         {/* ── HMNN Prediction — only visible in "predict" phase ────── */}
         <div className={`prediction-panel ${phase === "predict" || roundWinner ? "pred-visible" : "pred-hidden"}`}>
-          <div className="pred-header">🧠 HMNN PREDICTION</div>
+          <div className="pred-header">HMNN PREDICTION</div>
           {prediction ? (
             <div className={`pred-value-big ${prediction === "RED" ? "pred-red" : "pred-green"}`}>
-              {prediction === "RED" ? "🔴 RED" : "🟢 GREEN"}
+              {prediction === "RED" ? " RED" : " GREEN"}
               {roundWinner && (
                 <span className={`pred-outcome ${predCorrect ? "pred-correct" : "pred-wrong"}`}>
-                  {predCorrect ? " ✅ CORRECT" : " ❌ WRONG"}
+                  {predCorrect ? "CORRECT" : " WRONG"}
                 </span>
               )}
             </div>
           ) : (
             <div className="pred-computing">
-              {phase === "predict" ? "⏳ Computing from last 5 rounds…" : "—"}
+              {phase === "predict" ? " Computing from last 5 rounds…" : "—"}
             </div>
           )}
         </div>
@@ -247,7 +247,7 @@ export default function App() {
         <div className="voter-count">
           👤 <strong>{humanCount}</strong> human{humanCount !== 1 ? "s" : ""} voted
           {phase === "agents" && (
-            <span className="agent-fill"> · 🤖 agents voting now…</span>
+            <span className="agent-fill"> ·  agents voting now…</span>
           )}
           {phase === "voting" && humanCount < 12 && (
             <span className="agent-fill"> · agents fill remaining slots at 10s</span>
@@ -293,7 +293,7 @@ export default function App() {
         {/* Status message */}
         {hasVoted ? (
           <div className={`voted-message ${userVote === "RED" ? "voted-red" : "voted-green"}`}>
-            ✅ Voted <strong>{userVote}</strong>
+             Voted <strong>{userVote}</strong>
             &nbsp;· Emotion: <strong>{EMOTION_OPTIONS.find(o => o.value === emotionFeel)?.label}</strong>
             &nbsp;· History: <strong>{INFLUENCE_OPTIONS.find(o => o.value === influenceHistory)?.label}</strong>
           </div>
@@ -309,7 +309,7 @@ export default function App() {
         {roundWinner && (
           <div className={`winner-box winner-${roundWinner.toLowerCase()}`}>
             {roundWinner === "TIE" ? "⚖️ It's a TIE!"
-             : roundWinner === "RED" ? "🔴 RED Wins!" : "🟢 GREEN Wins!"}
+             : roundWinner === "RED" ? " RED Wins!" : " GREEN Wins!"}
           </div>
         )}
 
@@ -317,12 +317,12 @@ export default function App() {
         <div className="button-row">
           <button className="vote-btn red-btn"
             onClick={() => castVote("RED")} disabled={!votingOpen || hasVoted}>
-            <span className="btn-icon">🔴</span>
+            <span className="btn-icon"></span>
             <span className="btn-label">RED</span>
           </button>
           <button className="vote-btn green-btn"
             onClick={() => castVote("GREEN")} disabled={!votingOpen || hasVoted}>
-            <span className="btn-icon">🟢</span>
+            <span className="btn-icon"></span>
             <span className="btn-label">GREEN</span>
           </button>
         </div>
