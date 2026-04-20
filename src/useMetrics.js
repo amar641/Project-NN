@@ -1,18 +1,16 @@
 // src/useMetrics.js
-// Subscribes to the "metrics" Firestore collection and returns
-// live accuracy + loss arrays ready for charting.
 import { useState, useEffect } from "react";
-import { collection, query, orderBy, limit, onSnapshot } from "firebase/firestore";
+import { collection, query, orderBy, onSnapshot } from "firebase/firestore";
 import { db } from "./firebase";
 
-export function useMetrics(maxPoints = 50) {
+export function useMetrics() {
   const [metrics, setMetrics] = useState([]);
 
   useEffect(() => {
     const q = query(
       collection(db, "metrics"),
-      orderBy("round", "asc"),
-      limit(maxPoints)
+      orderBy("round", "asc")
+      // no limit — we want full history for cumulative accuracy
     );
 
     const unsub = onSnapshot(q, (snap) => {
@@ -22,7 +20,7 @@ export function useMetrics(maxPoints = 50) {
     });
 
     return () => unsub();
-  }, [maxPoints]);
+  }, []);
 
-  return metrics;   // [{round, accuracy, loss, reward, correct, ts}, ...]
+  return metrics;
 }

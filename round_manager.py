@@ -65,6 +65,35 @@ def init_firebase():
         cred = credentials.Certificate(FIREBASE_CRED)
         firebase_admin.initialize_app(cred)
     return firestore.client()
+def _write_metrics(self, round_num: int, metrics: dict):
+    # Read previous cumulative totals from Firestore so restarts don't reset the graph
+    prev_snap = self.db.collection("metrics").document(str(round_num - 1)).get()
+    prev_correct = 0
+    prev_total   = 0
+    if prev_snap.exists:
+        p = prev_snap.to_dict()
+        prev_correct = p.get("cumCorrect", 0)
+        prev_total   = p.get("cumTotal",   0)
+
+    cum_correct = prev_correct + (1 if metrics.get("correct") else 0)
+    cum_total   = prev_total   + 1
+    cum_acc     = cum_correct / cum_total
+    cum_loss    = 1.0 - cum_acc
+
+    self.db.collection("metrics").document(str(round_num)).set({
+        "round":      round_num,
+        "correct":    metrics.get("correct", False),
+        "reward":     metrics.get("reward", 0),
+        # per-round fields kept for reference
+        "accuracy":   metrics.get("accuracy", 0),
+        "loss":       metrics.get("loss", 1),
+        # cumulative fields — these drive the training graph
+        "cumCorrect": cum_correct,
+        "cumTotal":   cum_total,
+        "cumAcc":     round(cum_acc, 4),
+        "cumLoss":    round(cum_loss, 4),
+        "ts":         int(time.time() * 1000),
+    })
 
 # ─── Agent decision via OpenAI ────────────────────────────────────────────────
 async def _agent_openai(agent: dict, history: list[dict]) -> dict:
@@ -267,6 +296,7 @@ class RoundManager:
         # ── Advance round ─────────────────────────────────────────────────
         self._advance_round(round_num)
         print(f"[Round {round_num}] COMPLETE → advanced to round {round_num + 1}")
+    
 
     # ── Get all agent decisions and write them concurrently ───────────────
     async def _get_all_agent_decisions(self, agent_pool: list, round_num: int) -> list:
